@@ -4,7 +4,7 @@
 
 ## MODULES:
 
-1. fifo1.v : this is the top-level wrapper-module that includes all clock
+1. fifo.v : this is the top-level wrapper-module that includes all clock
 domains. The top module is only used as a wrapper to instantiate all of the other FIFO modules used in the
 design. If this FIFO is used as part of a larger ASIC or FPGA design, this top-level wrapper would probably be
 discarded to permit grouping of the other FIFO modules into their respective clock domains for improved

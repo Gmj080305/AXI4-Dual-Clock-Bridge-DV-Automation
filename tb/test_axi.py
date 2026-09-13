@@ -22,60 +22,87 @@ class AXIWriteSeq(uvm_sequence):
             await self.start_item(item)
             await self.finish_item(item)
 
-# 3. Driver (Injects transactions into Slave port)
+# 3. Driver (Injects transactions into the mclk domain)
 class AXIDriver(uvm_driver):
     def build_phase(self):
         self.dut = cocotb.top
         
     async def run_phase(self):
-        # Initialize
-        self.dut.s_axi_awvalid.value = 0
-        self.dut.s_axi_wvalid.value = 0
+        # Initialize m_ interface signals to 0 to prevent 'X' states
+        self.dut.m_awvalid.value = 0
+        self.dut.m_wvalid.value = 0
+        self.dut.m_arvalid.value = 0
+        self.dut.m_rready.value = 1
+        self.dut.m_bready.value = 1
+        
+        # Tie off AXI4 burst/id signals for single-beat writes
+        self.dut.m_awid.value = 0
+        self.dut.m_awlen.value = 0
+        self.dut.m_awsize.value = 2 # 4 bytes
+        self.dut.m_awburst.value = 1 # INCR
+        self.dut.m_wstrb.value = 0xF
+        self.dut.m_wlast.value = 1
         
         while True:
             item = await self.seq_item_port.get_next_item()
-            await RisingEdge(self.dut.s_axi_aclk)
+            await RisingEdge(self.dut.mclk)
             
             if item.op_type == "WRITE":
-                self.dut.s_axi_awaddr.value = item.addr
-                self.dut.s_axi_awvalid.value = 1
-                self.dut.s_axi_wdata.value = item.data
-                self.dut.s_axi_wvalid.value = 1
+                # Drive Write Address Channel
+                self.dut.m_awaddr.value = item.addr
+                self.dut.m_awvalid.value = 1
                 
-                await self.wait_for_handshake(self.dut.s_axi_awvalid, self.dut.s_axi_awready)
-                self.dut.s_axi_awvalid.value = 0
+                # Drive Write Data Channel
+                self.dut.m_wdata.value = item.data
+                self.dut.m_wvalid.value = 1
                 
-                await self.wait_for_handshake(self.dut.s_axi_wvalid, self.dut.s_axi_wready)
-                self.dut.s_axi_wvalid.value = 0
+                # Handshake AW channel
+                await self.wait_for_handshake(self.dut.mclk, self.dut.m_awvalid, self.dut.m_awready)
+                self.dut.m_awvalid.value = 0
+                
+                # Handshake W channel
+                await self.wait_for_handshake(self.dut.mclk, self.dut.m_wvalid, self.dut.m_wready)
+                self.dut.m_wvalid.value = 0
                 
             self.seq_item_port.item_done()
 
-    async def wait_for_handshake(self, valid, ready):
+    async def wait_for_handshake(self, clk, valid, ready):
         while True:
-            await RisingEdge(self.dut.s_axi_aclk)
+            await RisingEdge(clk)
             if valid.value == 1 and ready.value == 1:
                 break
 
-# 4. Monitor (Samples the Master port)
+# 4. Monitor (Samples the sclk domain)
 class AXIMonitor(uvm_monitor):
     def build_phase(self):
         self.dut = cocotb.top
         self.ap = uvm_analysis_port("ap", self)
 
     async def run_phase(self):
-        self.dut.m_axi_awready.value = 1 
-        self.dut.m_axi_wready.value = 1
+        # Emulate a downstream slave that is always ready
+        self.dut.s_awready.value = 1 
+        self.dut.s_wready.value = 1
+        
+        # Tie off downstream response signals
+        self.dut.s_bvalid.value = 1
+        self.dut.s_bresp.value = 0
+        self.dut.s_bid.value = 0
         
         while True:
-            await RisingEdge(self.dut.m_axi_aclk)
-            if self.dut.m_axi_awvalid.value == 1 and self.dut.m_axi_awready.value == 1:
+            await RisingEdge(self.dut.sclk)
+            
+            # Sample Address Channel Handshake
+            if self.dut.s_awvalid.value == 1 and self.dut.s_awready.value == 1:
                 item = AXIItem("sampled_item")
-                item.addr = int(self.dut.m_axi_awaddr.value)
+                # Address is sampled
+                item.addr = int(self.dut.s_awaddr.value)
                 
-                while not (self.dut.m_axi_wvalid.value == 1 and self.dut.m_axi_wready.value == 1):
-                    await RisingEdge(self.dut.m_axi_aclk)
+                # Wait for Data Channel Handshake
+                while not (self.dut.s_wvalid.value == 1 and self.dut.s_wready.value == 1):
+                    await RisingEdge(self.dut.sclk)
                     
-                item.data = int(self.dut.m_axi_wdata.value)
+                # Data is sampled
+                item.data = int(self.dut.s_wdata.value)
                 self.ap.write(item)
 
 # 5. Scoreboard
@@ -112,22 +139,26 @@ class AXITest(uvm_test):
         self.raise_objection()
         seq = AXIWriteSeq.create("seq")
         await seq.start(self.env.agent.seqr)
-        await ClockCycles(cocotb.top.m_axi_aclk, 20)
+        
+        # Wait for Async FIFOs to drain into sclk domain
+        await ClockCycles(cocotb.top.sclk, 20) 
         self.drop_objection()
 
 # 8. Cocotb Entry
 @cocotb.test()
 async def test_cdc_bridge(dut):
-    # Asynchronous clocks (100MHz vs 150MHz)
-    cocotb.start_soon(Clock(dut.s_axi_aclk, 10.0, units="ns").start())
-    cocotb.start_soon(Clock(dut.m_axi_aclk, 6.66, units="ns").start())
+    # Drive the two asynchronous clocks
+    cocotb.start_soon(Clock(dut.mclk, 10.0, units="ns").start()) # 100 MHz
+    cocotb.start_soon(Clock(dut.sclk, 6.66, units="ns").start()) # ~150 MHz
     
-    # Reset
-    dut.s_axi_aresetn.value = 0
-    dut.m_axi_aresetn.value = 0
+    # Assert Async Resets (Active Low)
+    dut.mrst_n.value = 0
+    dut.srst_n.value = 0
     await Timer(20, units="ns")
-    dut.s_axi_aresetn.value = 1
-    dut.m_axi_aresetn.value = 1
+    
+    # De-assert Resets
+    dut.mrst_n.value = 1
+    dut.srst_n.value = 1
     await Timer(20, units="ns")
     
     await uvm_root().run_test("AXITest")

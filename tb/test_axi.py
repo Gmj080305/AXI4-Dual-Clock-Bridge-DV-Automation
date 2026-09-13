@@ -1,3 +1,4 @@
+import random
 import cocotb
 from cocotb.triggers import RisingEdge, Timer, ClockCycles
 from cocotb.clock import Clock
@@ -11,14 +12,13 @@ class AXIItem(uvm_sequence_item):
         self.data = 0
         self.op_type = "WRITE"
 
-# 2. Sequence
+# 2. Sequence (Using Python's random module)
 class AXIWriteSeq(uvm_sequence):
     async def body(self):
         for i in range(10):
             item = AXIItem("item")
-            item.randomize()
             item.addr = i * 4
-            item.data = 0xDEADBEEF + i
+            item.data = random.randint(0, 0xFFFFFFFF) # Python random generation
             await self.start_item(item)
             await self.finish_item(item)
 
@@ -28,14 +28,12 @@ class AXIDriver(uvm_driver):
         self.dut = cocotb.top
         
     async def run_phase(self):
-        # Initialize m_ interface signals to 0 to prevent 'X' states
         self.dut.m_awvalid.value = 0
         self.dut.m_wvalid.value = 0
         self.dut.m_arvalid.value = 0
         self.dut.m_rready.value = 1
         self.dut.m_bready.value = 1
         
-        # Tie off AXI4 burst/id signals for single-beat writes
         self.dut.m_awid.value = 0
         self.dut.m_awlen.value = 0
         self.dut.m_awsize.value = 2 # 4 bytes
@@ -48,19 +46,14 @@ class AXIDriver(uvm_driver):
             await RisingEdge(self.dut.mclk)
             
             if item.op_type == "WRITE":
-                # Drive Write Address Channel
                 self.dut.m_awaddr.value = item.addr
                 self.dut.m_awvalid.value = 1
-                
-                # Drive Write Data Channel
                 self.dut.m_wdata.value = item.data
                 self.dut.m_wvalid.value = 1
                 
-                # Handshake AW channel
                 await self.wait_for_handshake(self.dut.mclk, self.dut.m_awvalid, self.dut.m_awready)
                 self.dut.m_awvalid.value = 0
                 
-                # Handshake W channel
                 await self.wait_for_handshake(self.dut.mclk, self.dut.m_wvalid, self.dut.m_wready)
                 self.dut.m_wvalid.value = 0
                 
@@ -79,11 +72,8 @@ class AXIMonitor(uvm_monitor):
         self.ap = uvm_analysis_port("ap", self)
 
     async def run_phase(self):
-        # Emulate a downstream slave that is always ready
         self.dut.s_awready.value = 1 
         self.dut.s_wready.value = 1
-        
-        # Tie off downstream response signals
         self.dut.s_bvalid.value = 1
         self.dut.s_bresp.value = 0
         self.dut.s_bid.value = 0
@@ -91,17 +81,13 @@ class AXIMonitor(uvm_monitor):
         while True:
             await RisingEdge(self.dut.sclk)
             
-            # Sample Address Channel Handshake
             if self.dut.s_awvalid.value == 1 and self.dut.s_awready.value == 1:
                 item = AXIItem("sampled_item")
-                # Address is sampled
                 item.addr = int(self.dut.s_awaddr.value)
                 
-                # Wait for Data Channel Handshake
                 while not (self.dut.s_wvalid.value == 1 and self.dut.s_wready.value == 1):
                     await RisingEdge(self.dut.sclk)
                     
-                # Data is sampled
                 item.data = int(self.dut.s_wdata.value)
                 self.ap.write(item)
 
@@ -139,26 +125,21 @@ class AXITest(uvm_test):
         self.raise_objection()
         seq = AXIWriteSeq.create("seq")
         await seq.start(self.env.agent.seqr)
-        
-        # Wait for Async FIFOs to drain into sclk domain
         await ClockCycles(cocotb.top.sclk, 20) 
         self.drop_objection()
 
-# 8. Cocotb Entry
+# 8. Cocotb Entry (Fixed 'units' to 'unit' deprecation warnings)
 @cocotb.test()
 async def test_cdc_bridge(dut):
-    # Drive the two asynchronous clocks
-    cocotb.start_soon(Clock(dut.mclk, 10.0, units="ns").start()) # 100 MHz
-    cocotb.start_soon(Clock(dut.sclk, 6.66, units="ns").start()) # ~150 MHz
+    cocotb.start_soon(Clock(dut.mclk, 10.0, unit="ns").start()) # 100 MHz
+    cocotb.start_soon(Clock(dut.sclk, 6.66, unit="ns").start()) # ~150 MHz
     
-    # Assert Async Resets (Active Low)
     dut.mrst_n.value = 0
     dut.srst_n.value = 0
-    await Timer(20, units="ns")
+    await Timer(20, unit="ns")
     
-    # De-assert Resets
     dut.mrst_n.value = 1
     dut.srst_n.value = 1
-    await Timer(20, units="ns")
+    await Timer(20, unit="ns")
     
     await uvm_root().run_test("AXITest")
